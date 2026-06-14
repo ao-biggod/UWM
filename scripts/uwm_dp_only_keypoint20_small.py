@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""E2-5: UWM DP-only + 20D keypoint, SMALL backbone (6L/256E/8H).
+
+Same as uwm_dp_only_keypoint20.py but with B3-scale backbone.
+Only changes:
+    embed_dim: 768 -> 256
+    depth:     12  -> 6
+    num_heads: 12  -> 8
+
+Unchanged:
+    no video loss
+    same 20D keypoint obs
+    original AdaLN-only conditioning (TransformerNoisePredictionNet)
+    same DDPM scheduler
+    same MinMax normalizer
+    same train target / eval slice
+    same LR, batch size, 20k steps, 50ep eval
+    no EMA, no cosine
+"""
+import argparse, json, os, sys, time
+from pathlib import Path
+from collections import deque
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "unified-world-model-main"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "diffusion_policy-main"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from models.dp.transformer import TransformerNoisePredictionNet
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+
+
+def load_zarr_data_keypoint(zarr_path):
+    import zarr
+    z = zarr.open(zarr_path, "r")
+    keypoint = z["data/keypoint"][:]
+    state = z["data/state"][:]
+    action = z["data/action"][:]
+    agent_pos = state[:, :2]
+    obs_20d = np.concatenate([keypoint.reshape(keypoint.shape[0], -1), agent_pos], axis=-1)
+    ep_ends = z["meta/episode_ends"][:]
+    episodes = []
+    start = 0
+    for end in ep_ends:
+        episodes.append((obs_20d[start:end], action[start:end]))
+        start = end
+    return episodes
+
+
+def build_dataset_kp(episodes, n_episodes, seq_len, obs_horizon=2, action_horizon=16):
+    all_obs, all_act = [], []
+    for ep_obs, ep_action in episodes[:n_episodes]:
+        T = len(ep_obs)
+        for i in range(T - seq_len):
+            all_obs.append(ep_obs[i:i + obs_horizon])
+            all_act.append(ep_action[i:i + seq_len])
+    ds = torch.utils.data.TensorDataset(
+        torch.tensor(np.stack(all_obs), dtype=torch.float32),
+        torch.tensor(np.stack(all_act), dtype=torch.float32))
+    return ds
+
+
+def collate_fn(batch):
+    return torch.stack([b[0] for b in batch]), torch.stack([b[1] for b in batch])
+
+
+class MinMaxNormalizer:
+    def __init__(self):
+        self.offset = None
+        self.scale = None
+    def fit(self, data):
+        dmin = data.min(axis=0)
+        dmax = data.max(axis=0)
+        self.offset = (dmax + dmin) / 2.0
+        self.scale = (dmax - dmin) / 2.0
+        self.scale[self.scale < 1e-6] = 1.0
+        return self
+    def normalize(self, data):
+        return (data - self.offset) / self.scale
+    def unnormalize(self, data):
+        return data * self.scale + self.offset
+
+
+def build_uwm_dit_policy(obs_dim, action_dim, action_len, device,
+                         embed_dim=768, depth=12, num_heads=12):
+    """UWM TransformerNoisePredictionNet based DiT policy."""
+
+    class LowdimObsEncoder(nn.Module):
+        def __init__(self, obs_dim, num_frames, embed_dim):
+            super().__init__()
+            in_dim = obs_dim * num_frames
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, embed_dim),
+                nn.Mish(),
+                nn.Linear(embed_dim, embed_dim))
+        def forward(self, obs):
+            B, T, D = obs.shape
+            return self.net(obs.reshape(B, T * D))
+
+    class LowdimDiTPolicy(nn.Module):
+        def __init__(self, obs_dim, action_len, action_dim,
+                     embed_dim=768, depth=12, num_heads=12):
+            super().__init__()
+            self.action_len = action_len
+            self.action_dim = action_dim
+            self.obs_encoder = LowdimObsEncoder(obs_dim, 2, embed_dim)
+            self.noise_pred_net = TransformerNoisePredictionNet(
+                input_len=action_len, input_dim=action_dim,
+                global_cond_dim=embed_dim,
+                timestep_embed_dim=256, embed_dim=embed_dim,
+                depth=depth, num_heads=num_heads, mlp_ratio=4, qkv_bias=True)
+            self.noise_scheduler = DDPMScheduler(
+                num_train_timesteps=100, beta_schedule="squaredcos_cap_v2",
+                clip_sample=True, prediction_type="epsilon")
+            self.num_inference_steps = 10
+
+        def forward(self, obs, action):
+            B = action.shape[0]
+            obs_embed = self.obs_encoder(obs)
+            noise = torch.randn_like(action)
+            t = torch.randint(0, self.noise_scheduler.config.num_train_timesteps,
+                              (B,), device=action.device).long()
+            noisy_action = self.noise_scheduler.add_noise(action, noise, t)
+            noise_pred = self.noise_pred_net(noisy_action, t, global_cond=obs_embed)
+            return F.mse_loss(noise_pred, noise)
+
+        @torch.no_grad()
+        def sample(self, obs):
+            B, device = obs.shape[0], obs.device
+            obs_embed = self.obs_encoder(obs)
+            action = torch.randn(B, self.action_len, self.action_dim, device=device)
+            self.noise_scheduler.set_timesteps(self.num_inference_steps)
+            for t_step in self.noise_scheduler.timesteps:
+                t = torch.full((B,), t_step, device=device, dtype=torch.long)
+                noise_pred = self.noise_pred_net(action, t, global_cond=obs_embed)
+                action = self.noise_scheduler.step(noise_pred, t_step, action).prev_sample
+            return action
+
+    return LowdimDiTPolicy(
+        obs_dim=obs_dim, action_len=action_len, action_dim=action_dim,
+        embed_dim=embed_dim, depth=depth, num_heads=num_heads).to(device)
+
+
+def eval_fixed_buffer(model, norm_state, norm_action, device, n_eps=50):
+    from diffusion_policy.env.pusht.pusht_keypoints_env import PushTKeypointsEnv
+    from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
+
+    model.eval()
+    results = []
+    for ep in range(n_eps):
+        seed = 100000 + ep
+        env = MultiStepWrapper(
+            PushTKeypointsEnv(legacy=True, keypoint_visible_rate=1.0),
+            n_obs_steps=2, n_action_steps=8)
+        env.seed(seed)
+        raw_obs = env.reset()
+
+        obs_buffer = deque(maxlen=2)
+        Do = raw_obs.shape[-1] // 2
+        obs_buffer.append(raw_obs[0, :Do])
+        obs_buffer.append(raw_obs[1, :Do])
+        rewards = []
+        done = False
+        step = 0
+
+        while not done and step < 300:
+            state_np = np.stack(list(obs_buffer))
+            state_t = torch.from_numpy(state_np).float().to(device).unsqueeze(0)
+            state_norm = (state_t - torch.tensor(norm_state.offset, device=device).float()) / torch.tensor(norm_state.scale, device=device).float()
+
+            with torch.no_grad():
+                action_norm = model.sample(state_norm)[0]
+            action_raw = action_norm * torch.tensor(norm_action.scale, device=device).float() + torch.tensor(norm_action.offset, device=device).float()
+            action_raw = np.clip(action_raw.cpu().numpy(), 0.0, 512.0)
+            exec_actions = action_raw[:8]
+
+            raw_obs, reward, done, info = env.step(exec_actions)
+            rewards.append(float(reward))
+            done = bool(np.all(done))
+            Do = raw_obs.shape[-1] // 2
+            obs_buffer.append(raw_obs[1, :Do])
+            step += 1
+
+        max_r = float(max(rewards)) if rewards else 0.0
+        results.append(max_r)
+        if ep < 5 or ep % 10 == 0:
+            print(f"  Ep {ep:3d}: max_reward={max_r:.4f}", flush=True)
+
+    scores = np.array(results)
+    print(f"\n  eval ({n_eps}eps): mean={scores.mean():.4f} std={scores.std():.4f} "
+          f"median={np.median(scores):.4f} ep>0.5={(scores>0.5).sum()}/{n_eps}")
+    return scores
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--max-train-steps", type=int, default=20000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--n-eval-episodes", type=int, default=50)
+    parser.add_argument("--output-dir", type=str,
+                        default="outputs/e2_uwm_kp_small")
+    parser.add_argument("--skip-eval", action="store_true")
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    obs_horizon, action_horizon, seq_len = 2, 16, 19
+    obs_dim = 20
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # E2-5 specific: SMALL backbone
+    EMBED_DIM = 256
+    DEPTH = 6
+    NUM_HEADS = 8
+
+    print(f"{'='*60}")
+    print(f"E2-5: UWM DP-only + 20D Keypoint SMALL ({DEPTH}L/{EMBED_DIM}E/{NUM_HEADS}H)")
+    print(f"  Only changes from uwm_dp_only_keypoint20.py:")
+    print(f"    embed_dim: 768 -> {EMBED_DIM}")
+    print(f"    depth:     12  -> {DEPTH}")
+    print(f"    num_heads: 12  -> {NUM_HEADS}")
+    print(f"  Unchanged: AdaLN-only, no video, same scheduler/normalizer/eval")
+    print(f"  Training steps: {args.max_train_steps}")
+    print(f"{'='*60}")
+
+    # Data
+    zarr_path = "diffusion_policy-main/data/pusht/pusht_cchi_v7_replay.zarr"
+    episodes = load_zarr_data_keypoint(zarr_path)
+    all_obs = np.concatenate([s for s, _ in episodes[:90]], axis=0)
+    all_action = np.concatenate([a for _, a in episodes[:90]], axis=0)
+
+    norm_state = MinMaxNormalizer().fit(all_obs)
+    norm_action = MinMaxNormalizer().fit(all_action)
+
+    dataset = build_dataset_kp(episodes, 90, seq_len, obs_horizon, action_horizon)
+    print(f"Training samples: {len(dataset)}")
+
+    # Build model (SMALL)
+    model = build_uwm_dit_policy(obs_dim=obs_dim, action_dim=2, action_len=16,
+                                 device=device, embed_dim=EMBED_DIM,
+                                 depth=DEPTH, num_heads=NUM_HEADS)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model params: {n_params / 1e6:.2f}M")
+    print(f"Model variant: small_dit_{DEPTH}L_{EMBED_DIM}E_{NUM_HEADS}H")
+
+    # Print key shapes for sanity
+    print(f"\n[Shape check]")
+    print(f"  obs_encoder[0].weight:  {list(model.obs_encoder.net[0].weight.shape)}")
+    print(f"  noise_pred_net.pos_embed: {list(model.noise_pred_net.pos_embed.shape)}")
+    print(f"  noise_pred_net.blocks: {len(model.noise_pred_net.blocks)} layers")
+
+    # Training
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, drop_last=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-6)
+    data_iter = iter(loader)
+    t0 = time.time()
+
+    for step in range(args.max_train_steps):
+        try:
+            obs_np, act_np = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            obs_np, act_np = next(data_iter)
+
+        obs_state = (obs_np.to(device) - torch.tensor(norm_state.offset, device=device).float()) / torch.tensor(norm_state.scale, device=device).float()
+        action_target = act_np[:, obs_horizon - 1: obs_horizon - 1 + action_horizon].to(device)
+        action_norm = (action_target - torch.tensor(norm_action.offset, device=device).float()) / torch.tensor(norm_action.scale, device=device).float()
+
+        model.train()
+        loss = model(obs_state, action_norm)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        if step < 10 or step % 100 == 0:
+            elapsed = max(time.time() - t0, 1e-6)
+            print(f"  step {step:6d}: loss={loss.item():.6f}  {step / elapsed:.1f} s/s", flush=True)
+
+    elapsed = time.time() - t0
+    print(f"\nTraining done in {elapsed:.1f}s  ({args.max_train_steps} steps)")
+
+    # Offline MSE (quick, for monitoring only)
+    model.eval()
+    obs_test, act_test = dataset[:64]
+    obs_norm = (obs_test.to(device) - torch.tensor(norm_state.offset, device=device).float()) / torch.tensor(norm_state.scale, device=device).float()
+    with torch.no_grad():
+        act_pred_norm = model.sample(obs_norm)
+    act_pred_raw = act_pred_norm * torch.tensor(norm_action.scale, device=device).float() + torch.tensor(norm_action.offset, device=device).float()
+    gt_target = act_test[:, obs_horizon - 1: obs_horizon - 1 + action_horizon].to(device)
+    mse_all = F.mse_loss(act_pred_raw, gt_target).item()
+    print(f"  quick offline MSE all16: {mse_all:.1f}")
+
+    # Save checkpoint
+    torch.save({
+        "model": model.state_dict(),
+        "step": args.max_train_steps - 1,
+        "action_normalizer": {"offset": norm_action.offset.tolist(), "scale": norm_action.scale.tolist()},
+        "state_normalizer": {"offset": norm_state.offset.tolist(), "scale": norm_state.scale.tolist()},
+        "config": {"model_variant": f"small_dit_{DEPTH}L_{EMBED_DIM}E_{NUM_HEADS}H",
+                   "obs_horizon": obs_horizon, "action_horizon": action_horizon,
+                   "obs_dim": obs_dim, "action_len": 16,
+                   "embed_dim": EMBED_DIM, "depth": DEPTH, "num_heads": NUM_HEADS},
+    }, os.path.join(args.output_dir, "latest.pt"))
+    print(f"Saved: {args.output_dir}/latest.pt")
+
+    # Eval
+    if not args.skip_eval:
+        print(f"\n{'='*60}")
+        print(f"Eval: {args.n_eval_episodes} episodes")
+        scores = eval_fixed_buffer(model, norm_state, norm_action, device, args.n_eval_episodes)
+        summary = {"model_variant": f"small_dit_{DEPTH}L_{EMBED_DIM}E_{NUM_HEADS}H",
+                   "mean": float(scores.mean()), "std": float(scores.std()),
+                   "median": float(np.median(scores)), "n_eps": args.n_eval_episodes,
+                   "ep_gt_05": int((scores > 0.5).sum())}
+        with open(os.path.join(args.output_dir, "eval_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Eval summary saved: {args.output_dir}/eval_summary.json")
+
+    print(f"\n{'='*60}")
+    print(f"E2-5 complete. Model: small_dit_{DEPTH}L_{EMBED_DIM}E_{NUM_HEADS}H")
+    print(f"Output dir: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

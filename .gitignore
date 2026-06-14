@@ -1,0 +1,47 @@
+# Model checkpoints and weights
+*.pth
+*.ckpt
+*.pt
+*.safetensors
+*.bin
+*.pkl
+*.pickle
+
+# Output directories (full)
+artifacts_keep/
+outputs/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# conda
+conda_env/

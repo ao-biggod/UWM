@@ -1,0 +1,19 @@
+defaults:
+  - dataset: pusht_image
+  - model: uwm
+  - template_train
+  - _self_
+
+model:
+  action_len: 16
+  action_dim: 2
+  obs_encoder:
+    use_low_dim: true
+    use_language: false
+    resize_shape: null
+    crop_shape: null
+    random_crop: false
+
+num_frames: 19
+obs_num_frames: 2
+batch_size: 1

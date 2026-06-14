@@ -1,0 +1,19 @@
+_target_: datasets.pusht.make_pusht_dataset
+name: pusht_image
+zarr_path: /root/autodl-tmp/UWM_pushT/diffusion_policy-main/data/pusht/pusht_cchi_v7_replay.zarr
+shape_meta:
+  obs:
+    image:
+      shape: [96, 96, 3]
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+seq_len: 19
+val_ratio: 0.02
+max_train_episodes: 90
+seed: 42
+normalize_action: true
+normalize_lowdim: true

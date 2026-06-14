@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tar tzf *)",
+      "Bash(python3 -c ' *)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv)",
+      "Bash(ps -p 106156 -o pid,cmd --no-headers)",
+      "Bash(kill 2197)",
+      "Bash(pip list *)",
+      "Bash(python3 -c \"from diffusers import AutoencoderKL; print\\('import ok'\\)\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 -c \"import dill; print\\('dill ok'\\)\")",
+      "Bash(python3 -c \"import hydra; print\\('hydra ok'\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'lowdim noclip infer-only: {d[\\\\\"mean_max_reward\\\\\"]:.4f}'\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'dp_only noclip infer-only: {d[\\\\\"mean_max_reward\\\\\"]:.4f}'\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'B1 meanstd+noclip retrain: {d[\\\\\"mean_max_reward\\\\\"]:.4f}'\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'B2 minmax+clip retrain:   {d[\\\\\"mean_max_reward\\\\\"]:.4f}'\\)\")"
+    ]
+  }
+}
