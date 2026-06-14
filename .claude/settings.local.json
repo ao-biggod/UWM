@@ -60,7 +60,13 @@
       "Bash(git init *)",
       "Bash(git branch *)",
       "Bash(git remote *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(kill 1563)",
+      "Bash(ssh-keygen *)",
+      "Bash(ssh -o StrictHostKeyChecking=accept-new -T git@github.com)"
     ]
   }
 }
